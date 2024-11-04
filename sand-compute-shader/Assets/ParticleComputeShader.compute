@@ -1,0 +1,84 @@
+#pragma kernel CSMain
+
+struct Particle
+{
+    float3 Position;
+    float3 PreviousPosition;
+    float3 Velocity;
+    float Radius;
+};
+
+RWStructuredBuffer<Particle> particles;
+RWByteAddressBuffer grid;
+RWByteAddressBuffer gridCounts;
+int gridSize;
+float cellSize;
+float deltaTime;
+float circleRadius;
+
+[numthreads(256, 1, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    int index = id.x;
+    Particle particle = particles[index];
+
+    // Calculate grid cell
+    int2 cell = int2(floor(particle.Position.xy / cellSize));
+    int hash = cell.x + cell.y * gridSize;
+
+    // Atomic add to grid count
+    uint oldCount;
+    gridCounts.InterlockedAdd(hash * 4, 1, oldCount);
+    grid.Store((hash * 256 + oldCount) * 4, index);
+
+    // Verlet integration
+    float3 temp = particle.Position;
+    particle.Position += particle.Position - particle.PreviousPosition + -9.81f * deltaTime * deltaTime;
+    particle.PreviousPosition = temp;
+
+    // Collision detection within the same cell
+    for (uint i = 0; i < oldCount; i++)
+    {
+        uint otherIndex;
+        grid.Load((hash * 256 + i) * 4, otherIndex);
+        if (otherIndex != index)
+        {
+            Particle otherParticle = particles[otherIndex];
+            float3 delta = particle.Position - otherParticle.Position;
+            float distance = length(delta);
+            float minDist = particle.Radius + otherParticle.Radius;
+
+            if (distance < minDist)
+            {
+                // Resolve collision
+                float3 normal = normalize(delta);
+                float penetrationDepth = minDist - distance;
+                float3 correction = normal * penetrationDepth * 0.5f;
+
+                particle.Position += correction;
+                otherParticle.Position -= correction;
+
+                // Update velocities
+                float3 relativeVelocity = particle.Velocity - otherParticle.Velocity;
+                float3 collisionImpulse = normal * dot(relativeVelocity, normal);
+                particle.Velocity -= collisionImpulse;
+                otherParticle.Velocity += collisionImpulse;
+
+                // Write back the other particle
+                particles[otherIndex] = otherParticle;
+            }
+        }
+    }
+
+    // Boundary constraint to a circle of radius 100
+    float distanceFromCenter = length(particle.Position);
+    if (distanceFromCenter > circleRadius)
+    {
+        float3 normal = normalize(particle.Position);
+        particle.Position = normal * circleRadius;
+        particle.Velocity -= 2.0f * dot(particle.Velocity, normal) * normal;
+    }
+
+    // Write back the updated particle
+    particles[index] = particle;
+}
